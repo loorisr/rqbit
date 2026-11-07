@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Read,
     net::SocketAddr,
+    num::NonZeroU16,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -21,7 +22,7 @@ use crate::{
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
-    listen::{Accept, ListenerOptions},
+    listen::{Accept, ListenResult, ListenerOptions},
     merge_streams::merge_streams,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
@@ -104,6 +105,14 @@ impl SessionDatabase {
     }
 }
 
+/// What's needed to replace the running listeners with ones on a different port.
+struct ActiveListener {
+    opts: ListenerOptions,
+    bind_device: Option<BindDevice>,
+    // Stops the listener tasks and the uTP socket.
+    cancel: CancellationToken,
+}
+
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
@@ -113,8 +122,11 @@ pub struct Session {
 
     // Network
     peer_id: Id20,
-    announce_port: Option<u16>,
-    listen_addr: Option<SocketAddr>,
+    // Peer streams subscribe to this to re-announce when it's updated.
+    announce_port: tokio::sync::watch::Sender<Option<u16>>,
+    listen_addr: RwLock<Option<SocketAddr>>,
+    // None if the session isn't listening. Also serializes listen port changes.
+    active_listener: tokio::sync::Mutex<Option<ActiveListener>>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
@@ -595,12 +607,14 @@ impl Session {
                 None => None,
             };
 
-            let listen_result = if let Some(listen_opts) = opts.listen.take() {
+            let listener_opts = opts.listen.take();
+            let listener_cancel = token.child_token();
+            let listen_result = if let Some(listen_opts) = listener_opts.clone() {
                 Some(
                     listen_opts
                         .start(
                             opts.root_span.as_ref().and_then(|s| s.id()),
-                            token.child_token(),
+                            listener_cancel.clone(),
                             bind_device.as_ref(),
                         )
                         .await
@@ -796,8 +810,17 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
-                announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
-                listen_addr: listen_result.as_ref().map(|l| l.addr),
+                announce_port: tokio::sync::watch::Sender::new(
+                    listen_result.as_ref().and_then(|l| l.announce_port),
+                ),
+                listen_addr: RwLock::new(listen_result.as_ref().map(|l| l.addr)),
+                active_listener: tokio::sync::Mutex::new(listener_opts.map(|opts| {
+                    ActiveListener {
+                        opts,
+                        bind_device: bind_device.clone(),
+                        cancel: listener_cancel.clone(),
+                    }
+                })),
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 connector: stream_connector,
@@ -821,48 +844,8 @@ impl Session {
                 lsd,
             });
 
-            if let Some(mut listen) = listen_result {
-                if let Some(tcp) = listen.tcp_socket.take() {
-                    let max_pending_incoming_handshake_checks =
-                        listen.max_pending_incoming_handshake_checks;
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "tcp_listen", addr = ?listen.addr),
-                        "tcp_listen",
-                        {
-                            let this = session.clone();
-                            async move {
-                                this.task_listener(tcp, max_pending_incoming_handshake_checks)
-                                    .await
-                            }
-                        },
-                    );
-                }
-                if let Some(utp) = listen.utp_socket.take() {
-                    let max_pending_incoming_handshake_checks =
-                        listen.max_pending_incoming_handshake_checks;
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "utp_listen", addr = ?listen.addr),
-                        "utp_listen",
-                        {
-                            let this = session.clone();
-                            async move {
-                                this.task_listener(utp, max_pending_incoming_handshake_checks)
-                                    .await
-                            }
-                        },
-                    );
-                }
-                if listen.enable_upnp_port_forwarding
-                    && let Some(announce_port) = listen.announce_port
-                {
-                    info!(port = announce_port, "starting UPnP port forwarder");
-                    let bind_device = bind_device.clone();
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
-                        "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
-                    );
-                }
+            if let Some(listen) = listen_result {
+                session.spawn_listener_tasks(listen, listener_cancel, bind_device);
             }
 
             if let Some(persistence) = session.persistence.as_ref() {
@@ -906,6 +889,93 @@ impl Session {
             Ok(session)
         }
         .boxed()
+    }
+
+    fn spawn_listener_tasks(
+        self: &Arc<Self>,
+        mut listen: ListenResult,
+        cancel: CancellationToken,
+        bind_device: Option<BindDevice>,
+    ) {
+        let max_pending_incoming_handshake_checks = listen.max_pending_incoming_handshake_checks;
+        if let Some(tcp) = listen.tcp_socket.take() {
+            let this = self.clone();
+            spawn_with_cancel(
+                debug_span!(parent: self.rs(), "tcp_listen", addr = ?listen.addr),
+                "tcp_listen",
+                cancel.clone(),
+                async move {
+                    this.task_listener(tcp, max_pending_incoming_handshake_checks)
+                        .await
+                },
+            );
+        }
+        if let Some(utp) = listen.utp_socket.take() {
+            let this = self.clone();
+            spawn_with_cancel(
+                debug_span!(parent: self.rs(), "utp_listen", addr = ?listen.addr),
+                "utp_listen",
+                cancel.clone(),
+                async move {
+                    this.task_listener(utp, max_pending_incoming_handshake_checks)
+                        .await
+                },
+            );
+        }
+        if listen.enable_upnp_port_forwarding
+            && let Some(announce_port) = listen.announce_port
+        {
+            info!(port = announce_port, "starting UPnP port forwarder");
+            spawn_with_cancel(
+                debug_span!(parent: self.rs(), "upnp_forward", port = announce_port),
+                "upnp_forward",
+                cancel,
+                Self::task_upnp_port_forwarder(announce_port, bind_device),
+            );
+        }
+    }
+
+    /// Start listening on the given port, and advertise it to trackers, DHT and LSD.
+    ///
+    /// This is meant for ports assigned at runtime, e.g. a VPN's forwarded port.
+    ///
+    /// The new port is bound before the old one is released, so on error the session
+    /// keeps listening as before. Established TCP connections are unaffected, but uTP
+    /// connections on the old port are dropped, as they share its socket.
+    ///
+    /// Always re-announces, even if the port didn't change: a VPN may reconnect with
+    /// the same port and a different public IP.
+    pub async fn set_listen_port(self: &Arc<Self>, port: NonZeroU16) -> anyhow::Result<()> {
+        let port = port.get();
+        let mut guard = self.active_listener.lock().await;
+        let active = guard
+            .as_mut()
+            .context("the session is not listening for incoming connections")?;
+
+        if self.listen_addr().map(|a| a.port()) != Some(port) {
+            let mut opts = active.opts.clone();
+            opts.listen_addr.set_port(port);
+            // Explicitly set, as otherwise it would be dropped for loopback listen addresses.
+            opts.announce_port = Some(port);
+
+            let cancel = self.cancellation_token.child_token();
+            let listen = opts
+                .clone()
+                .start(self.rs(), cancel.clone(), active.bind_device.as_ref())
+                .await
+                .with_context(|| format!("error listening on port {port}"))?;
+
+            self.connector.set_utp_socket(listen.utp_socket.clone());
+            *self.listen_addr.write() = Some(listen.addr);
+            active.cancel.cancel();
+            self.spawn_listener_tasks(listen, cancel.clone(), active.bind_device.clone());
+            active.opts = opts;
+            active.cancel = cancel;
+        }
+
+        info!(port, "updated listen port, re-announcing torrents");
+        self.announce_port.send_replace(Some(port));
+        Ok(())
     }
 
     async fn check_incoming_connection(
@@ -1554,22 +1624,6 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
-        let dht_rx = if is_private {
-            None
-        } else {
-            self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
-            })
-        };
-
-        let lsd_rx = if is_private {
-            None
-        } else {
-            self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
-            })
-        };
-
         if self.disable_trackers {
             trackers.clear();
         }
@@ -1584,33 +1638,79 @@ impl Session {
             trackers.extend(self.trackers.iter().cloned());
         }
 
-        let tracker_rx_stats = PeerRxTorrentInfo {
-            info_hash,
-            session: self.clone(),
+        let this = self.clone();
+        let make_announcing_rx = move |announce_port: Option<u16>| -> Option<PeerStream> {
+            let dht_and_lsd_port = if announce { announce_port } else { None };
+            let dht_rx = if is_private {
+                None
+            } else {
+                this.dht
+                    .as_ref()
+                    .map(|dht| dht.get_peers(info_hash, dht_and_lsd_port))
+            };
+
+            let lsd_rx = if is_private {
+                None
+            } else {
+                this.lsd
+                    .as_ref()
+                    .map(|lsd| lsd.announce(info_hash, dht_and_lsd_port))
+            };
+
+            let tracker_rx_stats = PeerRxTorrentInfo {
+                info_hash,
+                session: this.clone(),
+            };
+            let tracker_rx = TrackerComms::start(
+                info_hash,
+                this.peer_id,
+                trackers.iter().cloned().collect(),
+                Box::new(tracker_rx_stats),
+                force_tracker_interval,
+                announce_port.unwrap_or(4240),
+                this.reqwest_client.clone(),
+                this.udp_tracker_client.clone(),
+            );
+
+            merge_two_optional_streams(merge_two_optional_streams(dht_rx, tracker_rx), lsd_rx)
         };
-        let tracker_rx = TrackerComms::start(
-            info_hash,
-            self.peer_id,
-            trackers.into_iter().collect(),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
-            self.reqwest_client.clone(),
-            self.udp_tracker_client.clone(),
-        );
+
+        let mut announce_port_rx = self.announce_port.subscribe();
+        let announce_port = *announce_port_rx.borrow_and_update();
+        let announcing_rx = make_announcing_rx(announce_port).map(|mut current| -> PeerStream {
+            // Restart DHT, trackers and LSD whenever the port is updated. Dropping the old
+            // streams stops them, and restarting them makes them announce right away.
+            Box::pin(async_stream::stream! {
+                let mut finished = false;
+                loop {
+                    tokio::select! {
+                        changed = announce_port_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let announce_port = *announce_port_rx.borrow_and_update();
+                            if let Some(next) = make_announcing_rx(announce_port) {
+                                current = next;
+                                finished = false;
+                            }
+                        }
+                        addr = current.next(), if !finished => {
+                            match addr {
+                                Some(addr) => yield addr,
+                                None => finished = true,
+                            }
+                        }
+                    }
+                }
+            })
+        });
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
         } else {
             Some(futures::stream::iter(initial_peers))
         };
-        merge_two_optional_streams(
-            merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
-            ),
-            lsd_rx,
-        )
+        merge_two_optional_streams(announcing_rx, initial_peers_rx)
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
@@ -1645,11 +1745,11 @@ impl Session {
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
-        self.listen_addr
+        *self.listen_addr.read()
     }
 
     pub fn announce_port(&self) -> Option<u16> {
-        self.announce_port
+        *self.announce_port.borrow()
     }
 
     async fn resolve_magnet(

@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::{BindDevice, UtpSocketUdp};
+use parking_lot::RwLock;
 use serde::Serialize;
 use tracing::debug;
 
@@ -132,7 +133,8 @@ pub(crate) struct StreamConnector {
     proxy_config: Option<SocksProxyConfig>,
     enable_tcp: bool,
     bind_device: Option<BindDevice>,
-    utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+    // Replaced when the session starts listening on a different port.
+    utp_socket: RwLock<Option<Arc<librqbit_utp::UtpSocketUdp>>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
 }
@@ -156,11 +158,15 @@ impl StreamConnector {
         Ok(Self {
             proxy_config: config.socks_proxy_config,
             enable_tcp: config.enable_tcp,
-            utp_socket: config.utp_socket,
+            utp_socket: RwLock::new(config.utp_socket),
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
         })
+    }
+
+    pub(crate) fn set_utp_socket(&self, socket: Option<Arc<librqbit_utp::UtpSocketUdp>>) {
+        *self.utp_socket.write() = socket;
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {
@@ -253,7 +259,8 @@ impl StreamConnector {
         let tcp_failed_notify = tokio::sync::Notify::new();
 
         let utp_connect = async {
-            let sock = match self.utp_socket.as_ref() {
+            let sock = self.utp_socket.read().clone();
+            let sock = match sock {
                 Some(sock) => sock,
                 None => return Ok(None),
             };

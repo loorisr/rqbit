@@ -128,6 +128,43 @@ cargo install rqbit
 
 Docker images are published at [ikatson/rqbit](https://hub.docker.com/r/ikatson/rqbit)
 
+Images of this fork, which include the gluetun integration below, are published at `ghcr.io/loorisr/rqbit`.
+
+### VPN port forwarding with gluetun
+
+[gluetun](https://github.com/qdm12/gluetun) can tell rqbit which port its VPN provider forwarded. When
+port forwarding is ready, gluetun runs a command that calls rqbit's `POST /listen_port` API. rqbit then
+moves its TCP and uTP listeners to that port and re-announces all torrents.
+
+```yaml
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 3030:3030 # rqbit's API and web UI
+    environment:
+      # Add the settings of your VPN provider here.
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- -nv --retry-connrefused --header="Content-Type: application/json" --post-data "{\"port\":{{PORT}}}" http://127.0.0.1:3030/listen_port'
+
+  rqbit:
+    image: ghcr.io/loorisr/rqbit:latest
+    network_mode: service:gluetun
+    environment:
+      - RQBIT_UPNP_PORT_FORWARD_DISABLE=true
+    volumes:
+      - ./downloads:/home/rqbit/downloads
+```
+
+If you set `RQBIT_HTTP_BASIC_AUTH_USERPASS`, also pass `--user` and `--password` to `wget`.
+
+rqbit doesn't remember this port. If you restart rqbit without restarting gluetun, restart gluetun or
+call `POST /listen_port` again. Use `GET /listen_port` to see the current ports.
+
+When the port changes, established TCP connections are kept, but uTP connections are dropped.
+
 ## Build
 
 Just a regular Rust binary build process.

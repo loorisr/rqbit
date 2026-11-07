@@ -67,6 +67,8 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/add_peers": "Add peers (newline-delimited)",
             "POST /torrents/{id_or_infohash}/update_only_files": "Change the selection of files to download. You need to POST json of the following form {\"only_files\": [0, 1, 2]}",
             "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
+            "GET /listen_port": "The port listened on and the port announced to peers",
+            "POST /listen_port": "Listen on and announce another port. You need to POST json of the following form {\"port\": 12345}",
         },
         "server": "rqbit",
         "version": env!("CARGO_PKG_VERSION"),
@@ -105,10 +107,12 @@ pub fn make_api_router(state: ApiState) -> Router {
             "/torrents/{id}/stream/{file_id}/{*filename}",
             get(streaming::h_torrent_stream_file),
         )
-        .route("/torrents/limits", get(configure::h_get_session_ratelimits));
+        .route("/torrents/limits", get(configure::h_get_session_ratelimits))
+        .route("/listen_port", get(configure::h_get_listen_port));
 
     if !state.opts.read_only {
         api_router = api_router
+            .route("/listen_port", post(configure::h_set_listen_port))
             .route("/torrents", post(torrents::h_torrents_post))
             .route(
                 "/torrents/limits",
