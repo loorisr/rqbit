@@ -147,7 +147,7 @@ services:
     environment:
       # Add the settings of your VPN provider here.
       - VPN_PORT_FORWARDING=on
-      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- -nv --retry-connrefused --header="Content-Type: application/json" --post-data "{\"port\":{{PORT}}}" http://127.0.0.1:3030/listen_port'
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- -nv --retry-connrefused --header="Content-Type:application/json" --post-data "{\"port\":{{PORT}}}" http://127.0.0.1:3030/listen_port'
 
   rqbit:
     image: ghcr.io/loorisr/rqbit:latest
